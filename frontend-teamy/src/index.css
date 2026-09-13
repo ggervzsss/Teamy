@@ -1,0 +1,323 @@
+@import url("https://fonts.googleapis.com/css2?family=Geist:wght@500&family=Hanken+Grotesk:wght@400;700;800&display=swap");
+
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+  font-family:
+    "Hanken Grotesk",
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+  background: #09090b;
+  color: #e4e1e7;
+  --surface: #09090b;
+  --surface-dim: #09090b;
+  --surface-bright: #18181b;
+  --surface-container-low: #1b1b1f;
+  --surface-container: #1f1f23;
+  --surface-container-high: #2a2a2e;
+  --surface-container-highest: #353439;
+  --on-surface: #e4e1e7;
+  --on-surface-variant: #c4c7c8;
+  --outline: #8e9192;
+  --outline-variant: #444748;
+  --primary: #ffffff;
+  --secondary: #c6c6c6;
+  --background: #09090b;
+  --error: #ffb4ab;
+  --glass-border: rgba(255, 255, 255, 0.15);
+  --glass-faint-border: rgba(255, 255, 255, 0.1);
+  --glass-panel: rgba(255, 255, 255, 0.05);
+  --glass-hover: rgba(255, 255, 255, 0.08);
+  --glass-raised: rgba(255, 255, 255, 0.1);
+  --shadow-deep: 0 20px 40px rgba(0, 0, 0, 0.5);
+
+  /* Centralized Teamy Signature Brand Palette (Exact Match to Sidebar & Active Pill Tone) */
+  --brand-purple-from: rgba(168, 85, 247, 0.35);
+  --brand-purple-to: rgba(124, 58, 237, 0.25);
+  --brand-purple-hover-from: rgba(168, 85, 247, 0.5);
+  --brand-purple-hover-to: rgba(147, 51, 234, 0.4);
+  --brand-purple-border: rgba(168, 85, 247, 0.4);
+  --brand-purple-shadow: 0 4px 16px rgba(168, 85, 247, 0.25);
+  --brand-purple-shadow-hover: 0 8px 24px rgba(168, 85, 247, 0.4);
+  --brand-purple-glass-bg: rgba(168, 85, 247, 0.2);
+  --brand-purple-glass-hover: rgba(168, 85, 247, 0.32);
+  --brand-purple-glass-active: rgba(168, 85, 247, 0.38);
+  --brand-purple-glow: rgba(168, 85, 247, 0.15);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--background);
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  overflow-x: hidden;
+  background: radial-gradient(circle at 88% 8%, rgba(79, 70, 229, 0.05), transparent 26rem), radial-gradient(circle at 18% 82%, rgba(37, 99, 235, 0.04), transparent 28rem), var(--background);
+  color: var(--on-surface);
+  font-size: 16px;
+  line-height: 1.6;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button:not(:disabled),
+[role="button"]:not(:disabled) {
+  cursor: pointer;
+}
+
+button:disabled,
+[role="button"]:disabled {
+  cursor: not-allowed;
+}
+
+button,
+a {
+  -webkit-tap-highlight-color: transparent;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.teamy-doc-editor {
+  color-scheme: light;
+}
+
+.teamy-doc-editor:empty::before {
+  content: "Start writing...";
+  color: #8e9192;
+}
+
+.teamy-doc-editor h1,
+.teamy-doc-editor h2,
+.teamy-doc-editor h3 {
+  margin: 1.1em 0 0.45em;
+  line-height: 1.2;
+}
+
+.teamy-doc-editor h1 {
+  font-size: 2.25rem;
+}
+
+.teamy-doc-editor h2 {
+  font-size: 1.75rem;
+}
+
+.teamy-doc-editor p,
+.teamy-doc-editor ul,
+.teamy-doc-editor ol,
+.teamy-doc-editor blockquote,
+.teamy-doc-editor table {
+  margin: 0 0 1rem;
+}
+
+.teamy-doc-editor ul,
+.teamy-doc-editor ol {
+  padding-left: 1.5rem;
+}
+
+.teamy-doc-editor a {
+  color: #1558d6;
+  text-decoration: underline;
+}
+
+.teamy-doc-editor table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.teamy-doc-editor td,
+.teamy-doc-editor th {
+  border: 1px solid #d0d0d0;
+  padding: 0.5rem;
+}
+
+.teamy-rich-text {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.teamy-rich-text > :first-child {
+  margin-top: 0;
+}
+
+.teamy-rich-text > :last-child {
+  margin-bottom: 0;
+}
+
+.teamy-rich-text p,
+.teamy-rich-text ul,
+.teamy-rich-text ol,
+.teamy-rich-text blockquote,
+.teamy-rich-text table {
+  margin: 0 0 0.75rem;
+}
+
+.teamy-rich-text ul,
+.teamy-rich-text ol {
+  padding-left: 1.35rem;
+}
+
+.teamy-rich-text ul {
+  list-style: disc;
+}
+
+.teamy-rich-text ol {
+  list-style: decimal;
+}
+
+.teamy-rich-text blockquote {
+  border-left: 3px solid rgba(255, 255, 255, 0.18);
+  padding-left: 0.75rem;
+  color: #c4c7c8;
+}
+
+.teamy-rich-text a {
+  color: #bfdbfe;
+  text-decoration: underline;
+}
+
+.teamy-rich-text table {
+  display: block;
+  max-width: 100%;
+  width: 100%;
+  border-collapse: collapse;
+  overflow-x: auto;
+  border-radius: 0.5rem;
+}
+
+.teamy-rich-text td,
+.teamy-rich-text th {
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  padding: 0.45rem 0.6rem;
+  vertical-align: top;
+}
+
+.teamy-rich-text th {
+  background: rgba(255, 255, 255, 0.08);
+  color: #ffffff;
+  font-weight: 700;
+}
+
+.teamy-rich-text-editor:focus {
+  outline: none;
+}
+
+/* Custom Scrollbar */
+.custom-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+  scrollbar-gutter: stable;
+}
+
+.custom-scrollbar::-webkit-scrollbar {
+  width: 8px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background-color: rgba(255, 255, 255, 0.2);
+  border-radius: 10px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(255, 255, 255, 0.3);
+}
+
+/* GPU Compositor Layer Promotion & Layout Isolation */
+.gpu-panel {
+  transform: translateZ(0);
+  backface-visibility: hidden;
+  contain: layout paint;
+}
+
+.gpu-scroll {
+  contain: layout paint;
+}
+
+/* Centralized Teamy Design Utilities */
+.teamy-btn-primary {
+  background: linear-gradient(to right, var(--brand-purple-from), var(--brand-purple-to));
+  border: 1px solid var(--brand-purple-border);
+  color: #ffffff;
+  box-shadow: var(--brand-purple-shadow);
+  backdrop-filter: blur(12px);
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.teamy-btn-primary:hover:not(:disabled) {
+  background: linear-gradient(to right, var(--brand-purple-hover-from), var(--brand-purple-hover-to));
+  border-color: rgba(168, 85, 247, 0.55);
+  box-shadow: var(--brand-purple-shadow-hover);
+}
+
+.teamy-btn-primary:active:not(:disabled) {
+  transform: scale(0.95);
+}
+
+.teamy-btn-glass {
+  background-color: var(--brand-purple-glass-bg);
+  border: 1px solid var(--brand-purple-border);
+  color: #ffffff;
+  backdrop-filter: blur(10px);
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.teamy-btn-glass:hover:not(:disabled) {
+  background-color: var(--brand-purple-glass-hover);
+  border-color: rgba(168, 85, 247, 0.5);
+}
+
+.teamy-btn-glass:active:not(:disabled) {
+  transform: scale(0.95);
+}
+
+.teamy-fab {
+  background: linear-gradient(to right, var(--brand-purple-from), var(--brand-purple-to));
+  border: 1px solid var(--brand-purple-border);
+  color: #ffffff;
+  box-shadow: 0 8px 24px rgba(168, 85, 247, 0.25);
+  backdrop-filter: blur(16px);
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.teamy-fab:hover:not(:disabled) {
+  transform: scale(1.05);
+  background: linear-gradient(to right, var(--brand-purple-hover-from), var(--brand-purple-hover-to));
+  border-color: rgba(168, 85, 247, 0.6);
+  box-shadow: 0 12px 28px rgba(168, 85, 247, 0.4);
+}
+
+.teamy-fab:active:not(:disabled) {
+  transform: scale(0.95);
+}
+
+.teamy-pill-active {
+  background-color: var(--brand-purple-glass-active);
+  border: 1px solid var(--brand-purple-border);
+  color: #ffffff;
+  font-weight: 700;
+  box-shadow: 0 0 12px rgba(168, 85, 247, 0.3);
+}
+
+

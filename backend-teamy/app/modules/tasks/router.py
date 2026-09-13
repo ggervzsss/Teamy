@@ -1,0 +1,1326 @@
+import json
+from collections import defaultdict
+from datetime import UTC, date, datetime
+from typing import Annotated, Any
+from uuid import UUID
+
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
+from fastapi.encoders import jsonable_encoder
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+import app.core.database as db_module
+from app.core.cache import cache_get, cache_set, invalidate_project
+from app.core.cloudinary import delete_task_image_from_cloudinary, upload_task_image
+from app.core.config import Settings, get_settings
+from app.core.database import get_db
+from app.core.dependencies import get_current_user
+from app.core.domain_types import AssigneeStatus
+from app.core.html_sanitizer import sanitize_html
+from app.core.security import create_task_socket_ticket, decode_session_token, decode_task_socket_ticket
+from app.core.user_responses import serialize_project_user
+from app.modules.auth.models import User
+from app.modules.auth.schemas import UserResponse
+from app.modules.filehub.models import FileResource
+from app.modules.filehub.schemas import FileResourceSummaryResponse, LinkedTaskResponse
+from app.modules.notifications.router import create_user_notifications
+from app.modules.notifications.services import (
+    send_task_assignment_email_to_users,
+    send_task_changes_requested_email_to_users,
+    send_task_ready_for_review_email_to_project_leaders,
+)
+from app.modules.projects.dependencies import get_project_membership, require_project_active
+from app.modules.projects.models import Project, ProjectMember
+from app.modules.projects.schemas import ProjectMemberListResponse, ProjectMemberResponse
+from app.modules.tasks.models import Task, TaskAssignee, TaskFileLink, TaskImage
+from app.modules.tasks.schemas import (
+    TaskAssigneeResponse,
+    TaskAssigneeUpdateRequest,
+    TaskCreateRequest,
+    TaskExistingFileLinkRequest,
+    TaskImageResponse,
+    TaskLinkedFileCreateRequest,
+    TaskListResponse,
+    TaskResponse,
+    TaskReviewRequest,
+    TaskSocketTicketResponse,
+    TaskUpdateRequest,
+)
+
+router = APIRouter(prefix="/projects/{project_id}", tags=["tasks"])
+
+
+class TaskConnectionManager:
+    def __init__(self) -> None:
+        self.active_connections: dict[UUID, set[WebSocket]] = defaultdict(set)
+        self.connection_users: dict[int, tuple[UUID, dict[str, Any]]] = {}
+        self.connection_viewing_task: dict[int, UUID | None] = {}
+        self.connection_activity: dict[int, str | None] = {}
+        self.task_viewers: dict[tuple[UUID, UUID], set[int]] = defaultdict(set)
+
+    async def connect(self, project_id: UUID, user_info: dict[str, Any], websocket: WebSocket) -> None:
+        await websocket.accept()
+        self.active_connections[project_id].add(websocket)
+        ws_id = id(websocket)
+        self.connection_users[ws_id] = (project_id, user_info)
+        self.connection_viewing_task[ws_id] = None
+        self.connection_activity[ws_id] = None
+
+    def disconnect(self, project_id: UUID, websocket: WebSocket) -> UUID | None:
+        ws_id = id(websocket)
+        self.active_connections[project_id].discard(websocket)
+        if not self.active_connections[project_id]:
+            del self.active_connections[project_id]
+
+        prev_task_id = self.connection_viewing_task.pop(ws_id, None)
+        if prev_task_id:
+            self.task_viewers[(project_id, prev_task_id)].discard(ws_id)
+            if not self.task_viewers[(project_id, prev_task_id)]:
+                del self.task_viewers[(project_id, prev_task_id)]
+        self.connection_users.pop(ws_id, None)
+        self.connection_activity.pop(ws_id, None)
+        return prev_task_id
+
+    async def update_viewing_task(self, websocket: WebSocket, task_id: UUID | None) -> None:
+        ws_id = id(websocket)
+        if ws_id not in self.connection_users:
+            return
+
+        project_id, _ = self.connection_users[ws_id]
+        prev_task_id = self.connection_viewing_task.get(ws_id)
+
+        if prev_task_id and prev_task_id != task_id:
+            self.task_viewers[(project_id, prev_task_id)].discard(ws_id)
+            if not self.task_viewers[(project_id, prev_task_id)]:
+                del self.task_viewers[(project_id, prev_task_id)]
+            await self.broadcast_task_presence(project_id, prev_task_id)
+
+        if task_id:
+            self.task_viewers[(project_id, task_id)].add(ws_id)
+            self.connection_viewing_task[ws_id] = task_id
+            await self.broadcast_task_presence(project_id, task_id)
+        else:
+            self.connection_viewing_task[ws_id] = None
+            self.connection_activity[ws_id] = None
+
+    async def update_activity(self, websocket: WebSocket, activity: str | None) -> None:
+        ws_id = id(websocket)
+        if ws_id not in self.connection_users:
+            return
+
+        self.connection_activity[ws_id] = activity
+        task_id = self.connection_viewing_task.get(ws_id)
+        if task_id:
+            project_id, _ = self.connection_users[ws_id]
+            await self.broadcast_task_presence(project_id, task_id)
+
+    async def broadcast_task_presence(self, project_id: UUID, task_id: UUID) -> None:
+        viewer_ws_ids = self.task_viewers.get((project_id, task_id), set())
+        viewers_list: list[dict[str, Any]] = []
+        seen_user_ids: set[str] = set()
+
+        for ws_id in viewer_ws_ids:
+            if ws_id in self.connection_users:
+                _, u_info = self.connection_users[ws_id]
+                u_id = u_info["id"]
+                if u_id not in seen_user_ids:
+                    seen_user_ids.add(u_id)
+                    user_item = dict(u_info)
+                    user_item["activity"] = self.connection_activity.get(ws_id)
+                    viewers_list.append(user_item)
+
+        payload = jsonable_encoder(
+            {
+                "event": "task.presence",
+                "task_id": str(task_id),
+                "viewers": viewers_list,
+            }
+        )
+
+        dead_connections: list[WebSocket] = []
+        for websocket in self.active_connections.get(project_id, set()).copy():
+            try:
+                await websocket.send_json(payload)
+            except RuntimeError:
+                dead_connections.append(websocket)
+
+        for websocket in dead_connections:
+            self.disconnect(project_id, websocket)
+
+    async def broadcast(self, project_id: UUID, event: str, task: TaskResponse) -> None:
+        payload = jsonable_encoder({"event": event, "task": task})
+        dead_connections: list[WebSocket] = []
+        for websocket in self.active_connections.get(project_id, set()).copy():
+            try:
+                await websocket.send_json(payload)
+            except RuntimeError:
+                dead_connections.append(websocket)
+
+        for websocket in dead_connections:
+            self.disconnect(project_id, websocket)
+
+
+manager = TaskConnectionManager()
+
+
+def require_leader(membership: ProjectMember) -> None:
+    if membership.role not in ("leader", "co_leader"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Only project leaders or co-leaders can perform this action"
+        )
+
+
+async def get_project_member_user_ids(db: AsyncSession, project_id: UUID) -> set[UUID]:
+    result = await db.execute(select(ProjectMember.user_id).where(ProjectMember.project_id == project_id))
+    return set(result.scalars().all())
+
+
+async def get_project_leader_user_ids(db: AsyncSession, project_id: UUID) -> set[UUID]:
+    result = await db.execute(
+        select(ProjectMember.user_id).where(
+            ProjectMember.project_id == project_id, ProjectMember.role.in_(("leader", "co_leader"))
+        )
+    )
+    return set(result.scalars().all())
+
+
+async def user_is_task_assignee(db: AsyncSession, task_id: UUID, user_id: UUID) -> bool:
+    result = await db.execute(
+        select(TaskAssignee.id).where(TaskAssignee.task_id == task_id, TaskAssignee.user_id == user_id)
+    )
+    return result.scalar_one_or_none() is not None
+
+
+def require_private_task_creator(task: Task, user: User) -> None:
+    """Used for destructive actions (delete). Only the creator may proceed."""
+    if task.is_private and task.created_by_user_id != user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+
+
+async def require_private_task_access(db: AsyncSession, task: Task, user: User) -> None:
+    """Used for read/update actions. The creator OR any collaborator (assignee) may proceed."""
+    if not task.is_private:
+        return
+    if task.created_by_user_id == user.id:
+        return
+    is_assignee = await user_is_task_assignee(db, task.id, user.id)
+    if not is_assignee:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+
+
+def require_task_manager(project_member: ProjectMember, task: Task, user: User) -> None:
+    if task.is_private:
+        return
+    if project_member.role not in ("leader", "co_leader") and task.created_by_user_id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Only the task creator or project leader can edit this task"
+        )
+
+
+def resolve_task_start_date(start_date: date | None, due_date: date | None) -> date:
+    if start_date is not None:
+        return start_date
+    today = datetime.now(UTC).date()
+    if due_date is not None and due_date < today:
+        return due_date
+    return today
+
+
+def validate_task_date_range(start_date: date, due_date: date | None) -> None:
+    if due_date is not None and due_date < start_date:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Due date cannot be before start date"
+        )
+
+
+def build_linked_file_resource(
+    project_id: UUID, user_id: UUID, fallback_title: str, payload: TaskLinkedFileCreateRequest
+) -> FileResource:
+    linked_file_title = (payload.title or fallback_title).strip()
+    if not linked_file_title:
+        linked_file_title = fallback_title.strip()
+    linked_file_url = payload.url.strip() if payload.url else None
+    if payload.mode == "link" and not linked_file_url:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="URL is required for linked external files"
+        )
+    return FileResource(
+        project_id=project_id,
+        title=linked_file_title,
+        kind=payload.mode,
+        url=linked_file_url if payload.mode == "link" else None,
+        content_html=sanitize_html("<p></p>") if payload.mode == "doc" else None,
+        created_by_user_id=user_id,
+    )
+
+
+async def serialize_task_linked_files(db: AsyncSession, task: Task) -> list[FileResourceSummaryResponse]:
+    result = await db.execute(
+        select(FileResource, User, ProjectMember)
+        .join(TaskFileLink, TaskFileLink.file_resource_id == FileResource.id)
+        .join(User, User.id == FileResource.created_by_user_id)
+        .join(ProjectMember, (ProjectMember.user_id == User.id) & (ProjectMember.project_id == FileResource.project_id))
+        .where(TaskFileLink.task_id == task.id)
+        .order_by(FileResource.updated_at.desc(), FileResource.created_at.desc())
+    )
+    linked_task = LinkedTaskResponse(id=task.id, title=task.title, status=task.status)
+    return [
+        FileResourceSummaryResponse(
+            id=resource.id,
+            project_id=resource.project_id,
+            title=resource.title,
+            kind=resource.kind,
+            url=resource.url,
+            created_by=serialize_project_user(creator, member),
+            linked_tasks=[linked_task],
+            created_at=resource.created_at,
+            updated_at=resource.updated_at,
+        )
+        for resource, creator, member in result.all()
+    ]
+
+
+async def serialize_task_images(db: AsyncSession, task_id: UUID) -> list[TaskImageResponse]:
+    result = await db.execute(
+        select(TaskImage, User)
+        .join(User, User.id == TaskImage.uploaded_by_user_id)
+        .where(TaskImage.task_id == task_id)
+        .order_by(TaskImage.created_at.asc())
+    )
+    return [
+        TaskImageResponse(
+            id=img.id,
+            task_id=img.task_id,
+            uploaded_by=UserResponse(
+                id=uploader.id,
+                email=uploader.email,
+                full_name=uploader.full_name,
+                username=uploader.username,
+                avatar_url=uploader.avatar_url,
+                google_avatar_url=uploader.google_avatar_url,
+                last_online_at=uploader.last_online_at,
+            ),
+            url=img.url,
+            ticket_item_id=img.ticket_item_id,
+            created_at=img.created_at,
+        )
+        for img, uploader in result.all()
+    ]
+
+
+async def get_project_member_for_user(db: AsyncSession, project_id: UUID, user_id: UUID) -> ProjectMember | None:
+    result = await db.execute(
+        select(ProjectMember).where(ProjectMember.project_id == project_id, ProjectMember.user_id == user_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def serialize_task_assignees(db: AsyncSession, task: Task) -> list[TaskAssigneeResponse]:
+    assignee_result = await db.execute(
+        select(TaskAssignee, User, ProjectMember)
+        .join(User, User.id == TaskAssignee.user_id)
+        .join(ProjectMember, (ProjectMember.user_id == User.id) & (ProjectMember.project_id == task.project_id))
+        .where(TaskAssignee.task_id == task.id)
+        .order_by(User.full_name.asc(), User.email.asc())
+    )
+    return [
+        TaskAssigneeResponse(
+            id=assignee.id,
+            user=serialize_project_user(user, member),
+            status=assignee.status,
+            completed_at=assignee.completed_at,
+        )
+        for assignee, user, member in assignee_result.all()
+    ]
+
+
+async def serialize_task(db: AsyncSession, task: Task) -> TaskResponse:
+    creator = await db.get(User, task.created_by_user_id)
+    reviewed_by = await db.get(User, task.reviewed_by_user_id) if task.reviewed_by_user_id else None
+    if creator is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Task creator could not be loaded"
+        )
+    creator_member = await get_project_member_for_user(db, task.project_id, creator.id)
+    reviewed_by_member = await get_project_member_for_user(db, task.project_id, reviewed_by.id) if reviewed_by else None
+
+    return TaskResponse(
+        id=task.id,
+        project_id=task.project_id,
+        title=task.title,
+        description=task.description,
+        start_date=task.start_date,
+        due_date=task.due_date,
+        status=task.status,
+        is_record_only=task.is_record_only,
+        is_private=task.is_private,
+        personal_kind=task.personal_kind,
+        created_by=serialize_project_user(creator, creator_member),
+        reviewed_by=serialize_project_user(reviewed_by, reviewed_by_member) if reviewed_by else None,
+        reviewed_at=task.reviewed_at,
+        review_remarks=task.review_remarks,
+        assignees=await serialize_task_assignees(db, task),
+        linked_files=await serialize_task_linked_files(db, task),
+        images=await serialize_task_images(db, task.id),
+        created_at=task.created_at,
+        updated_at=task.updated_at,
+    )
+
+
+async def get_task_for_project(db: AsyncSession, project_id: UUID, task_id: UUID) -> Task:
+    result = await db.execute(select(Task).where(Task.project_id == project_id, Task.id == task_id))
+    task = result.scalar_one_or_none()
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+    return task
+
+
+async def move_task_after_assignee_update(db: AsyncSession, task: Task) -> None:
+    assignee_result = await db.execute(select(TaskAssignee).where(TaskAssignee.task_id == task.id))
+    assignees = list(assignee_result.scalars().all())
+    if any(assignee.status in {"in_progress", "ready_for_review"} for assignee in assignees):
+        task.status = "in_progress"
+    else:
+        task.status = "todo"
+    task.reviewed_by_user_id = None
+    task.reviewed_at = None
+
+
+async def serialize_tasks_batch(db: AsyncSession, tasks: list[Task], project_id: UUID) -> list[TaskResponse]:
+    if not tasks:
+        return []
+
+    task_ids = [t.id for t in tasks]
+    task_map = {t.id: t for t in tasks}
+
+    user_ids: set[UUID] = set()
+    for t in tasks:
+        user_ids.add(t.created_by_user_id)
+        if t.reviewed_by_user_id:
+            user_ids.add(t.reviewed_by_user_id)
+
+    user_result = await db.execute(select(User).where(User.id.in_(user_ids)))
+    users_by_id: dict[UUID, User] = {u.id: u for u in user_result.scalars().all()}
+
+    member_result = await db.execute(
+        select(ProjectMember).where(
+            ProjectMember.project_id == project_id,
+            ProjectMember.user_id.in_(user_ids),
+        )
+    )
+    members_by_user_id: dict[UUID, ProjectMember] = {m.user_id: m for m in member_result.scalars().all()}
+
+    assignee_result = await db.execute(
+        select(TaskAssignee, User, ProjectMember)
+        .join(User, User.id == TaskAssignee.user_id)
+        .join(ProjectMember, (ProjectMember.user_id == User.id) & (ProjectMember.project_id == project_id))
+        .where(TaskAssignee.task_id.in_(task_ids))
+        .order_by(User.full_name.asc(), User.email.asc())
+    )
+    assignees_by_task: dict[UUID, list[TaskAssigneeResponse]] = defaultdict(list)
+    for assignee, user, member in assignee_result.all():
+        assignees_by_task[assignee.task_id].append(
+            TaskAssigneeResponse(
+                id=assignee.id,
+                user=serialize_project_user(user, member),
+                status=assignee.status,
+                completed_at=assignee.completed_at,
+            )
+        )
+
+    linked_result = await db.execute(
+        select(TaskFileLink, FileResource, User, ProjectMember)
+        .join(FileResource, FileResource.id == TaskFileLink.file_resource_id)
+        .join(User, User.id == FileResource.created_by_user_id)
+        .join(ProjectMember, (ProjectMember.user_id == User.id) & (ProjectMember.project_id == project_id))
+        .where(TaskFileLink.task_id.in_(task_ids))
+        .order_by(FileResource.updated_at.desc(), FileResource.created_at.desc())
+    )
+    files_by_task: dict[UUID, list[FileResourceSummaryResponse]] = defaultdict(list)
+    for link, resource, creator, member in linked_result.all():
+        task = task_map[link.task_id]
+        linked_task = LinkedTaskResponse(id=task.id, title=task.title, status=task.status)
+        files_by_task[link.task_id].append(
+            FileResourceSummaryResponse(
+                id=resource.id,
+                project_id=resource.project_id,
+                title=resource.title,
+                kind=resource.kind,
+                url=resource.url,
+                created_by=serialize_project_user(creator, member),
+                linked_tasks=[linked_task],
+                created_at=resource.created_at,
+                updated_at=resource.updated_at,
+            )
+        )
+
+    images_result = await db.execute(
+        select(TaskImage, User)
+        .join(User, User.id == TaskImage.uploaded_by_user_id)
+        .where(TaskImage.task_id.in_(task_ids))
+        .order_by(TaskImage.created_at.asc())
+    )
+    images_by_task: dict[UUID, list[TaskImageResponse]] = defaultdict(list)
+    for img, uploader in images_result.all():
+        images_by_task[img.task_id].append(
+            TaskImageResponse(
+                id=img.id,
+                task_id=img.task_id,
+                uploaded_by=UserResponse(
+                    id=uploader.id,
+                    email=uploader.email,
+                    full_name=uploader.full_name,
+                    username=uploader.username,
+                    avatar_url=uploader.avatar_url,
+                    google_avatar_url=uploader.google_avatar_url,
+                    last_online_at=uploader.last_online_at,
+                ),
+                url=img.url,
+                ticket_item_id=img.ticket_item_id,
+                created_at=img.created_at,
+            )
+        )
+
+    results: list[TaskResponse] = []
+    for task in tasks:
+        creator = users_by_id.get(task.created_by_user_id)
+        if creator is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Task creator could not be loaded"
+            )
+        creator_member = members_by_user_id.get(creator.id)
+        reviewed_by = users_by_id.get(task.reviewed_by_user_id) if task.reviewed_by_user_id else None
+        reviewed_by_member = members_by_user_id.get(reviewed_by.id) if reviewed_by else None
+
+        results.append(
+            TaskResponse(
+                id=task.id,
+                project_id=task.project_id,
+                title=task.title,
+                description=task.description,
+                start_date=task.start_date,
+                due_date=task.due_date,
+                status=task.status,
+                is_record_only=task.is_record_only,
+                is_private=task.is_private,
+                personal_kind=task.personal_kind,
+                created_by=serialize_project_user(creator, creator_member),
+                reviewed_by=serialize_project_user(reviewed_by, reviewed_by_member) if reviewed_by else None,
+                reviewed_at=task.reviewed_at,
+                review_remarks=task.review_remarks,
+                assignees=assignees_by_task.get(task.id, []),
+                linked_files=files_by_task.get(task.id, []),
+                images=images_by_task.get(task.id, []),
+                created_at=task.created_at,
+                updated_at=task.updated_at,
+            )
+        )
+    return results
+
+
+@router.get("/members", response_model=ProjectMemberListResponse)
+async def list_project_members(
+    membership: Annotated[tuple[Project, ProjectMember], Depends(get_project_membership)],
+    db: AsyncSession = Depends(get_db),
+) -> ProjectMemberListResponse:
+    project, _ = membership
+    cache_key = f"project:{project.id}:members"
+    cached = await cache_get(cache_key)
+    if cached is not None:
+        return ProjectMemberListResponse(**cached)
+
+    result = await db.execute(
+        select(ProjectMember, User)
+        .join(User, User.id == ProjectMember.user_id)
+        .where(ProjectMember.project_id == project.id)
+        .order_by(ProjectMember.role.asc(), User.full_name.asc(), User.email.asc())
+    )
+    response = ProjectMemberListResponse(
+        members=[
+            ProjectMemberResponse(
+                id=member.id,
+                user=serialize_project_user(user, member),
+                role=member.role,
+                nickname=member.nickname,
+                joined_at=member.joined_at,
+            )
+            for member, user in result.all()
+        ]
+    )
+    await cache_set(cache_key, jsonable_encoder(response))
+    return response
+
+
+@router.get("/tasks", response_model=TaskListResponse)
+async def list_tasks(
+    membership: Annotated[tuple[Project, ProjectMember], Depends(get_project_membership)],
+    limit: Annotated[int | None, Query(ge=1, le=500)] = None,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    db: AsyncSession = Depends(get_db),
+) -> TaskListResponse:
+    project, _ = membership
+    cache_key = f"project:{project.id}:tasks:l={limit}:o={offset}"
+    cached = await cache_get(cache_key)
+    if cached is not None:
+        return TaskListResponse(**cached)
+
+    query = (
+        select(Task)
+        .where(Task.project_id == project.id, Task.is_private.is_(False))
+        .order_by(Task.created_at.desc())
+        .offset(offset)
+    )
+    if limit is not None:
+        query = query.limit(limit)
+    result = await db.execute(query)
+    tasks = list(result.scalars().all())
+    response = TaskListResponse(tasks=await serialize_tasks_batch(db, tasks, project.id))
+    await cache_set(cache_key, jsonable_encoder(response))
+    return response
+
+
+@router.get("/tasks/me", response_model=TaskListResponse)
+async def list_my_tasks(
+    user: Annotated[User, Depends(get_current_user)],
+    membership: Annotated[tuple[Project, ProjectMember], Depends(get_project_membership)],
+    limit: Annotated[int | None, Query(ge=1, le=500)] = None,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    db: AsyncSession = Depends(get_db),
+) -> TaskListResponse:
+    project, _ = membership
+    cache_key = f"project:{project.id}:tasks-me:{user.id}:l={limit}:o={offset}"
+    cached = await cache_get(cache_key)
+    if cached is not None:
+        return TaskListResponse(**cached)
+
+    query = (
+        select(Task)
+        .join(TaskAssignee, TaskAssignee.task_id == Task.id)
+        .where(Task.project_id == project.id, TaskAssignee.user_id == user.id)
+        .order_by(Task.created_at.desc())
+        .offset(offset)
+    )
+    if limit is not None:
+        query = query.limit(limit)
+    result = await db.execute(query)
+    tasks = list(result.scalars().all())
+    response = TaskListResponse(tasks=await serialize_tasks_batch(db, tasks, project.id))
+    await cache_set(cache_key, jsonable_encoder(response))
+    return response
+
+
+@router.get("/tasks/ws-ticket", response_model=TaskSocketTicketResponse)
+async def create_task_socket_ticket_endpoint(
+    user: Annotated[User, Depends(get_current_user)],
+    membership: Annotated[tuple[Project, ProjectMember], Depends(get_project_membership)],
+    settings=Depends(get_settings),
+) -> TaskSocketTicketResponse:
+    project, _ = membership
+    return TaskSocketTicketResponse(ticket=create_task_socket_ticket(user.id, project.id, settings))
+
+
+@router.post("/tasks", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
+async def create_task(
+    payload: TaskCreateRequest,
+    background_tasks: BackgroundTasks,
+    user: Annotated[User, Depends(get_current_user)],
+    membership: Annotated[tuple[Project, ProjectMember], Depends(get_project_membership)],
+    db: AsyncSession = Depends(get_db),
+    settings=Depends(get_settings),
+) -> TaskResponse:
+    project, project_member = membership
+    require_project_active(project)
+    is_done_on_create = payload.initial_status == "done"
+    is_record_only = payload.is_record_only or is_done_on_create
+    if payload.is_private and is_record_only:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Private tasks cannot be record-only")
+    if payload.is_private and payload.linked_file is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Private items cannot link shared resources"
+        )
+    if is_record_only:
+        require_leader(project_member)
+
+    assignee_ids = list(dict.fromkeys(payload.assignee_ids))
+    if payload.is_private:
+        if user.id not in set(assignee_ids):
+            assignee_ids = [user.id] + assignee_ids
+        else:
+            assignee_ids = [user.id] + [a for a in assignee_ids if a != user.id]
+
+    member_user_ids = await get_project_member_user_ids(db, project.id)
+    invalid_assignees = [assignee_id for assignee_id in assignee_ids if assignee_id not in member_user_ids]
+    if invalid_assignees:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Every assignee must be a project member")
+
+    start_date = resolve_task_start_date(payload.start_date, payload.due_date)
+    validate_task_date_range(start_date, payload.due_date)
+
+    completed_at = datetime.now(UTC) if is_done_on_create else None
+    task = Task(
+        project_id=project.id,
+        title=payload.title.strip(),
+        description=payload.description.strip() if payload.description else None,
+        start_date=start_date,
+        due_date=payload.due_date,
+        status=payload.initial_status,
+        is_record_only=is_record_only,
+        is_private=payload.is_private,
+        personal_kind=payload.personal_kind if payload.is_private else "task",
+        created_by_user_id=user.id,
+        reviewed_by_user_id=user.id if is_done_on_create else None,
+        reviewed_at=completed_at,
+    )
+    db.add(task)
+    await db.flush()
+
+    for assignee_id in assignee_ids:
+        db.add(
+            TaskAssignee(
+                task_id=task.id,
+                user_id=assignee_id,
+                status="ready_for_review" if is_done_on_create else payload.initial_status,
+                completed_at=completed_at,
+            )
+        )
+
+    if payload.linked_file is not None:
+        resource = build_linked_file_resource(project.id, user.id, payload.title, payload.linked_file)
+        db.add(resource)
+        await db.flush()
+        db.add(TaskFileLink(task_id=task.id, file_resource_id=resource.id))
+
+    if not is_done_on_create and not payload.is_private:
+        await create_user_notifications(
+            db,
+            set(assignee_ids),
+            project_id=project.id,
+            kind="task.assigned",
+            title=f"New task assigned: {task.title}",
+            body=f"You have been assigned to {task.title} in {project.name}.",
+            target_path=f"/projects/{project.slug}/task-board",
+            is_email_backed=True,
+            background_tasks=background_tasks,
+        )
+    await db.commit()
+    await invalidate_project(project.id)
+    await db.refresh(task)
+    response = await serialize_task(db, task)
+    if not is_done_on_create and not payload.is_private:
+        background_tasks.add_task(
+            send_task_assignment_email_to_users,
+            settings,
+            set(assignee_ids),
+            project.id,
+            project.name,
+            task.title,
+            task.due_date,
+        )
+    background_tasks.add_task(manager.broadcast, project.id, "task.created", response)
+    return response
+
+
+@router.patch("/tasks/{task_id}", response_model=TaskResponse)
+async def update_task(
+    task_id: UUID,
+    payload: TaskUpdateRequest,
+    background_tasks: BackgroundTasks,
+    user: Annotated[User, Depends(get_current_user)],
+    membership: Annotated[tuple[Project, ProjectMember], Depends(get_project_membership)],
+    db: AsyncSession = Depends(get_db),
+    settings=Depends(get_settings),
+) -> TaskResponse:
+    project, project_member = membership
+    require_project_active(project)
+    task = await get_task_for_project(db, project.id, task_id)
+    await require_private_task_access(db, task, user)
+    require_task_manager(project_member, task, user)
+    if task.is_private and payload.assignee_ids is not None:
+        if task.created_by_user_id != user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="Only the task creator can manage collaborators"
+            )
+        creator_id = task.created_by_user_id
+        if creator_id not in set(payload.assignee_ids):
+            payload.assignee_ids = [creator_id] + list(payload.assignee_ids)
+
+    if "title" in payload.model_fields_set and payload.title is not None:
+        task.title = payload.title.strip()
+    if "description" in payload.model_fields_set:
+        task.description = payload.description.strip() if payload.description else None
+    next_due_date = payload.due_date if "due_date" in payload.model_fields_set else task.due_date
+    if "start_date" in payload.model_fields_set:
+        task.start_date = resolve_task_start_date(payload.start_date, next_due_date)
+    if "due_date" in payload.model_fields_set:
+        task.due_date = next_due_date
+        due_date = task.due_date
+        if "start_date" not in payload.model_fields_set and due_date is not None and due_date < task.start_date:
+            task.start_date = due_date
+    validate_task_date_range(task.start_date, task.due_date)
+
+    assignees_changed = False
+    newly_assigned_user_ids: set[UUID] = set()
+    if payload.assignee_ids is not None:
+        assignee_ids = list(dict.fromkeys(payload.assignee_ids))
+        if not assignee_ids:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Choose at least one assignee")
+        member_user_ids = await get_project_member_user_ids(db, project.id)
+        invalid_assignees = [assignee_id for assignee_id in assignee_ids if assignee_id not in member_user_ids]
+        if invalid_assignees:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="Every assignee must be a project member"
+            )
+
+        assignee_result = await db.execute(select(TaskAssignee).where(TaskAssignee.task_id == task.id))
+        current_assignees = {assignee.user_id: assignee for assignee in assignee_result.scalars().all()}
+        next_assignee_ids = set(assignee_ids)
+        if set(current_assignees) != next_assignee_ids:
+            assignees_changed = True
+            newly_assigned_user_ids = next_assignee_ids - set(current_assignees)
+
+        for assignee_user_id, assignee in current_assignees.items():
+            if assignee_user_id not in next_assignee_ids:
+                await db.delete(assignee)
+
+        for assignee_id in assignee_ids:
+            if assignee_id not in current_assignees:
+                completed_at = datetime.now(UTC) if task.status == "done" else None
+                db.add(
+                    TaskAssignee(
+                        task_id=task.id,
+                        user_id=assignee_id,
+                        status="ready_for_review"
+                        if task.status == "done"
+                        else "todo"
+                        if task.status == "todo"
+                        else "in_progress",
+                        completed_at=completed_at,
+                    )
+                )
+
+    if assignees_changed and task.status == "for_review":
+        task.status = "in_progress"
+        task.reviewed_by_user_id = None
+        task.reviewed_at = None
+
+    if newly_assigned_user_ids and not task.is_private:
+        await create_user_notifications(
+            db,
+            newly_assigned_user_ids,
+            project_id=project.id,
+            kind="task.assigned",
+            title=f"New task assigned: {task.title}",
+            body=f"You have been assigned to {task.title} in {project.name}.",
+            target_path=f"/projects/{project.slug}/task-board",
+            is_email_backed=True,
+            background_tasks=background_tasks,
+        )
+    await db.commit()
+    await invalidate_project(project.id)
+    await db.refresh(task)
+    response = await serialize_task(db, task)
+    if newly_assigned_user_ids and not task.is_private:
+        background_tasks.add_task(
+            send_task_assignment_email_to_users,
+            settings,
+            newly_assigned_user_ids,
+            project.id,
+            project.name,
+            task.title,
+            task.due_date,
+        )
+    background_tasks.add_task(manager.broadcast, project.id, "task.updated", response)
+    return response
+
+
+@router.post("/tasks/{task_id}/linked-files", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
+async def link_task_file(
+    task_id: UUID,
+    payload: TaskLinkedFileCreateRequest,
+    background_tasks: BackgroundTasks,
+    user: Annotated[User, Depends(get_current_user)],
+    membership: Annotated[tuple[Project, ProjectMember], Depends(get_project_membership)],
+    db: AsyncSession = Depends(get_db),
+) -> TaskResponse:
+    project, project_member = membership
+    require_project_active(project)
+    task = await get_task_for_project(db, project.id, task_id)
+    require_private_task_creator(task, user)
+    if task.is_private:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Private items cannot link shared resources"
+        )
+    is_assignee = await user_is_task_assignee(db, task.id, user.id)
+    if project_member.role not in ("leader", "co_leader") and task.created_by_user_id != user.id and not is_assignee:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only assigned members, task creators, or project leaders can link task resources",
+        )
+
+    resource = build_linked_file_resource(project.id, user.id, task.title, payload)
+    db.add(resource)
+    await db.flush()
+    db.add(TaskFileLink(task_id=task.id, file_resource_id=resource.id))
+    await db.commit()
+    await invalidate_project(project.id)
+    await db.refresh(task)
+    response = await serialize_task(db, task)
+    background_tasks.add_task(manager.broadcast, project.id, "task.updated", response)
+    return response
+
+
+@router.post("/tasks/{task_id}/linked-files/existing", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
+async def link_existing_task_file(
+    task_id: UUID,
+    payload: TaskExistingFileLinkRequest,
+    background_tasks: BackgroundTasks,
+    user: Annotated[User, Depends(get_current_user)],
+    membership: Annotated[tuple[Project, ProjectMember], Depends(get_project_membership)],
+    db: AsyncSession = Depends(get_db),
+) -> TaskResponse:
+    project, project_member = membership
+    require_project_active(project)
+    task = await get_task_for_project(db, project.id, task_id)
+    require_private_task_creator(task, user)
+    if task.is_private:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Private items cannot link shared resources"
+        )
+    is_assignee = await user_is_task_assignee(db, task.id, user.id)
+    if project_member.role not in ("leader", "co_leader") and task.created_by_user_id != user.id and not is_assignee:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only assigned members, task creators, or project leaders can link task resources",
+        )
+
+    resource_result = await db.execute(
+        select(FileResource).where(FileResource.project_id == project.id, FileResource.id == payload.file_id)
+    )
+    resource = resource_result.scalar_one_or_none()
+    if resource is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File resource not found")
+
+    existing_link_result = await db.execute(
+        select(TaskFileLink).where(TaskFileLink.task_id == task.id, TaskFileLink.file_resource_id == resource.id)
+    )
+    if existing_link_result.scalar_one_or_none() is None:
+        db.add(TaskFileLink(task_id=task.id, file_resource_id=resource.id))
+        await db.commit()
+        await invalidate_project(project.id)
+        await db.refresh(task)
+
+    response = await serialize_task(db, task)
+    background_tasks.add_task(manager.broadcast, project.id, "task.updated", response)
+    return response
+
+
+@router.patch("/tasks/{task_id}/assignees/me", response_model=TaskResponse)
+async def update_my_task_status(
+    task_id: UUID,
+    payload: TaskAssigneeUpdateRequest,
+    background_tasks: BackgroundTasks,
+    user: Annotated[User, Depends(get_current_user)],
+    membership: Annotated[tuple[Project, ProjectMember], Depends(get_project_membership)],
+    db: AsyncSession = Depends(get_db),
+) -> TaskResponse:
+    project, _ = membership
+    require_project_active(project)
+    task = await get_task_for_project(db, project.id, task_id)
+    await require_private_task_access(db, task, user)
+    assignee_result = await db.execute(
+        select(TaskAssignee).where(TaskAssignee.task_id == task.id, TaskAssignee.user_id == user.id)
+    )
+    assignee = assignee_result.scalar_one_or_none()
+    if assignee is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only assigned members can update this task")
+    if task.is_private:
+        if payload.status == "ready_for_review":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="Private items do not use review status"
+            )
+        assignee.status = "ready_for_review" if payload.status == "done" else payload.status
+        assignee.completed_at = datetime.now(UTC) if payload.status == "done" else None
+        task.status = payload.status
+        task.reviewed_by_user_id = user.id if payload.status == "done" else None
+        task.reviewed_at = assignee.completed_at if payload.status == "done" else None
+        await db.commit()
+        await invalidate_project(project.id)
+        await db.refresh(task)
+        response = await serialize_task(db, task)
+        background_tasks.add_task(manager.broadcast, project.id, "task.updated", response)
+        return response
+    if task.status == "done":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Done tasks cannot be updated")
+    if payload.status not in {"in_progress", "ready_for_review"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Assigned tasks can only be moved to progress or ready for review",
+        )
+    if task.status == "for_review":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tasks in review cannot be updated until changes are requested",
+        )
+
+    assignee_status: AssigneeStatus = "in_progress" if payload.status == "in_progress" else "ready_for_review"
+    assignee.status = assignee_status
+    assignee.completed_at = datetime.now(UTC) if payload.status == "ready_for_review" else None
+    await move_task_after_assignee_update(db, task)
+    await db.commit()
+    await invalidate_project(project.id)
+    await db.refresh(task)
+    response = await serialize_task(db, task)
+    background_tasks.add_task(manager.broadcast, project.id, "task.updated", response)
+    return response
+
+
+@router.post("/tasks/{task_id}/submit-review", response_model=TaskResponse)
+async def submit_task_for_review(
+    task_id: UUID,
+    background_tasks: BackgroundTasks,
+    user: Annotated[User, Depends(get_current_user)],
+    membership: Annotated[tuple[Project, ProjectMember], Depends(get_project_membership)],
+    db: AsyncSession = Depends(get_db),
+    settings=Depends(get_settings),
+) -> TaskResponse:
+    project, _ = membership
+    require_project_active(project)
+    task = await get_task_for_project(db, project.id, task_id)
+    await require_private_task_access(db, task, user)
+    if task.is_private:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Private items do not use review submission"
+        )
+    if task.status == "done":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Done tasks cannot be submitted for review")
+    if task.status == "for_review":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Task is already for review")
+
+    assignee_result = await db.execute(select(TaskAssignee).where(TaskAssignee.task_id == task.id))
+    assignees = list(assignee_result.scalars().all())
+    if not any(assignee.user_id == user.id for assignee in assignees):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Only assigned members can submit this task for review"
+        )
+    if not assignees or any(assignee.status != "ready_for_review" for assignee in assignees):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Every assignee must be ready for review first"
+        )
+
+    task.status = "for_review"
+    task.reviewed_by_user_id = None
+    task.reviewed_at = None
+    await db.commit()
+    await invalidate_project(project.id)
+    await db.refresh(task)
+    response = await serialize_task(db, task)
+    leader_user_ids = await get_project_leader_user_ids(db, project.id)
+    await create_user_notifications(
+        db,
+        leader_user_ids,
+        project_id=project.id,
+        kind="task.ready_for_review",
+        title=f"Task submitted for review: {task.title}",
+        body=f"{task.title} in {project.name} has been submitted for review.",
+        target_path=f"/projects/{project.slug}/task-board",
+        is_email_backed=True,
+        background_tasks=background_tasks,
+    )
+    await db.commit()
+    await invalidate_project(project.id)
+    background_tasks.add_task(
+        send_task_ready_for_review_email_to_project_leaders, settings, project.id, project.name, task.title
+    )
+    background_tasks.add_task(manager.broadcast, project.id, "task.submitted", response)
+    return response
+
+
+@router.post("/tasks/{task_id}/review", response_model=TaskResponse)
+async def review_task(
+    task_id: UUID,
+    payload: TaskReviewRequest,
+    background_tasks: BackgroundTasks,
+    user: Annotated[User, Depends(get_current_user)],
+    membership: Annotated[tuple[Project, ProjectMember], Depends(get_project_membership)],
+    db: AsyncSession = Depends(get_db),
+    settings=Depends(get_settings),
+) -> TaskResponse:
+    project, project_member = membership
+    require_project_active(project)
+    require_leader(project_member)
+    task = await get_task_for_project(db, project.id, task_id)
+    if task.is_private:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+    if task.status != "for_review":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only tasks for review can be reviewed")
+
+    if payload.action == "approve":
+        task.status = "done"
+        task.reviewed_by_user_id = user.id
+        task.reviewed_at = datetime.now(UTC)
+        task.review_remarks = None
+    else:
+        task.status = "in_progress"
+        task.reviewed_by_user_id = None
+        task.reviewed_at = None
+        task.review_remarks = payload.remarks.strip() if payload.remarks else None
+        assignee_result = await db.execute(select(TaskAssignee).where(TaskAssignee.task_id == task.id))
+        task_assignees = assignee_result.scalars().all()
+        for assignee in task_assignees:
+            assignee.status = "in_progress"
+            assignee.completed_at = None
+        await create_user_notifications(
+            db,
+            {assignee.user_id for assignee in task_assignees},
+            project_id=project.id,
+            kind="task.changes_requested",
+            title=f"Changes requested: {task.title}",
+            body=task.review_remarks or f"{task.title} needs revisions or additional changes.",
+            target_path=f"/projects/{project.slug}/task-board",
+            is_email_backed=True,
+            background_tasks=background_tasks,
+        )
+
+    await db.commit()
+    await invalidate_project(project.id)
+    await db.refresh(task)
+    response = await serialize_task(db, task)
+    if payload.action == "request_changes":
+        background_tasks.add_task(
+            send_task_changes_requested_email_to_users,
+            settings,
+            {assignee.user.id for assignee in response.assignees},
+            project.id,
+            project.name,
+            task.title,
+            task.review_remarks,
+        )
+    background_tasks.add_task(manager.broadcast, project.id, "task.reviewed", response)
+    return response
+
+
+@router.delete("/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_task(
+    task_id: UUID,
+    background_tasks: BackgroundTasks,
+    user: Annotated[User, Depends(get_current_user)],
+    membership: Annotated[tuple[Project, ProjectMember], Depends(get_project_membership)],
+    db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> None:
+    project, project_member = membership
+    require_project_active(project)
+    task = await get_task_for_project(db, project.id, task_id)
+    require_private_task_creator(task, user)
+    require_task_manager(project_member, task, user)
+
+    response = await serialize_task(db, task)
+
+    task_images_result = await db.execute(
+        select(TaskImage.cloudinary_public_id).where(
+            TaskImage.task_id == task.id, TaskImage.cloudinary_public_id.isnot(None)
+        )
+    )
+    for public_id in task_images_result.scalars().all():
+        if public_id:
+            try:
+                await delete_task_image_from_cloudinary(settings, public_id)
+            except Exception:
+                pass
+
+    await db.delete(task)
+    await db.commit()
+    await invalidate_project(project.id)
+    background_tasks.add_task(manager.broadcast, project.id, "task.deleted", response)
+
+
+@router.get("/tasks/{task_id}/images", response_model=list[TaskImageResponse])
+async def list_task_images(
+    task_id: UUID,
+    user: Annotated[User, Depends(get_current_user)],
+    membership: Annotated[tuple[Project, ProjectMember], Depends(get_project_membership)],
+    db: AsyncSession = Depends(get_db),
+) -> list[TaskImageResponse]:
+    project, _ = membership
+    task = await get_task_for_project(db, project.id, task_id)
+    await require_private_task_access(db, task, user)
+    if not task.is_private:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Images are only available on private tasks"
+        )
+    return await serialize_task_images(db, task_id)
+
+
+@router.post("/tasks/{task_id}/images", response_model=TaskImageResponse, status_code=status.HTTP_201_CREATED)
+async def upload_task_image_endpoint(
+    task_id: UUID,
+    user: Annotated[User, Depends(get_current_user)],
+    membership: Annotated[tuple[Project, ProjectMember], Depends(get_project_membership)],
+    file: UploadFile = File(...),
+    ticket_item_id: str | None = Form(default=None),
+    db: AsyncSession = Depends(get_db),
+    settings=Depends(get_settings),
+) -> TaskImageResponse:
+    project, _ = membership
+    require_project_active(project)
+    task = await get_task_for_project(db, project.id, task_id)
+    await require_private_task_access(db, task, user)
+    if not task.is_private:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Images can only be uploaded to private tasks"
+        )
+
+    secure_url, public_id = await upload_task_image(settings, task_id, file)
+
+    img = TaskImage(
+        task_id=task_id,
+        uploaded_by_user_id=user.id,
+        url=secure_url,
+        cloudinary_public_id=public_id,
+        ticket_item_id=ticket_item_id or None,
+    )
+    db.add(img)
+    await db.commit()
+    await invalidate_project(project.id)
+    await db.refresh(img)
+
+    return TaskImageResponse(
+        id=img.id,
+        task_id=img.task_id,
+        uploaded_by=UserResponse(
+            id=user.id,
+            email=user.email,
+            full_name=user.full_name,
+            username=user.username,
+            avatar_url=user.avatar_url,
+            google_avatar_url=user.google_avatar_url,
+            last_online_at=user.last_online_at,
+        ),
+        url=img.url,
+        ticket_item_id=img.ticket_item_id,
+        created_at=img.created_at,
+    )
+
+
+@router.delete("/tasks/{task_id}/images/{image_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_task_image_endpoint(
+    task_id: UUID,
+    image_id: UUID,
+    user: Annotated[User, Depends(get_current_user)],
+    membership: Annotated[tuple[Project, ProjectMember], Depends(get_project_membership)],
+    db: AsyncSession = Depends(get_db),
+    settings=Depends(get_settings),
+) -> None:
+    project, _ = membership
+    require_project_active(project)
+    task = await get_task_for_project(db, project.id, task_id)
+    await require_private_task_access(db, task, user)
+
+    img_result = await db.execute(select(TaskImage).where(TaskImage.task_id == task_id, TaskImage.id == image_id))
+    img = img_result.scalar_one_or_none()
+    if img is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")
+
+    if img.uploaded_by_user_id != user.id and task.created_by_user_id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Only the uploader or task creator can delete this image"
+        )
+
+    public_id = img.cloudinary_public_id
+    await db.delete(img)
+    await db.commit()
+    await invalidate_project(project.id)
+
+    if public_id:
+        await delete_task_image_from_cloudinary(settings, public_id)
+
+
+@router.websocket("/tasks/ws")
+async def task_updates(websocket: WebSocket, project_id: UUID) -> None:
+    settings = get_settings()
+    ticket = websocket.query_params.get("ticket")
+
+    if ticket:
+        try:
+            user_id, ticket_project_id = decode_task_socket_ticket(ticket, settings)
+        except HTTPException:
+            await websocket.accept()
+            await websocket.close(code=1008)
+            return
+        if ticket_project_id != project_id:
+            await websocket.accept()
+            await websocket.close(code=1008)
+            return
+    else:
+        session_cookie = websocket.cookies.get(settings.session_cookie_name)
+        if not session_cookie:
+            await websocket.accept()
+            await websocket.close(code=1008)
+            return
+
+        try:
+            user_id = decode_session_token(session_cookie, settings)
+        except HTTPException:
+            await websocket.accept()
+            await websocket.close(code=1008)
+            return
+
+    async with db_module.SessionLocal() as db:
+        result = await db.execute(
+            select(ProjectMember).where(ProjectMember.project_id == project_id, ProjectMember.user_id == user_id)
+        )
+        if result.scalar_one_or_none() is None:
+            await websocket.accept()
+            await websocket.close(code=1008)
+            return
+
+        user_result = await db.execute(select(User).where(User.id == user_id))
+        user = user_result.scalar_one_or_none()
+        if user is None:
+            await websocket.accept()
+            await websocket.close(code=1008)
+            return
+
+        user_info = {
+            "id": str(user.id),
+            "full_name": user.full_name or "",
+            "username": getattr(user, "username", None),
+            "email": user.email,
+            "avatar_url": user.avatar_url,
+        }
+
+    await manager.connect(project_id, user_info, websocket)
+    try:
+        while True:
+            raw_text = await websocket.receive_text()
+            try:
+                msg = json.loads(raw_text)
+                if isinstance(msg, dict):
+                    action = msg.get("action")
+                    if action == "view_task":
+                        raw_task_id = msg.get("task_id")
+                        if raw_task_id:
+                            await manager.update_viewing_task(websocket, UUID(str(raw_task_id)))
+                    elif action == "leave_task":
+                        await manager.update_viewing_task(websocket, None)
+                    elif action == "activity":
+                        status = msg.get("status")
+                        await manager.update_activity(websocket, str(status) if status else None)
+            except (json.JSONDecodeError, ValueError, TypeError):
+                pass
+    except WebSocketDisconnect:
+        prev_task_id = manager.disconnect(project_id, websocket)
+        if prev_task_id:
+            await manager.broadcast_task_presence(project_id, prev_task_id)
